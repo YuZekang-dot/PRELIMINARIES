@@ -1,0 +1,30 @@
+# Local environment and credentials
+.env
+*.env
+dev/.env
+license.dat
+
+# Logs and runtime output
+dev/log/
+*.log
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Training/output artifacts
+checkpoints/
+models/
+outputs/
+runs/
+wandb/
+
+# OS files
+.DS_Store
+Thumbs.db
