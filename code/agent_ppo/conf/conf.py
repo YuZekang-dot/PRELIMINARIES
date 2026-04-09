@@ -15,13 +15,19 @@ class Config:
 
     # Feature dimensions / 特征维度
     HERO_STATE_DIM = 4
-    STATION_DIM = 7 * 1
+    STATION_FEAT_DIM = 7
+    STATION_TOPK = 3
+    STATION_DIM = STATION_FEAT_DIM * STATION_TOPK
+    CHARGER_DIM = 7
+    NPC_DIM = 7
     LEGAL_ACT_DIM = 8
     INDICATOR_DIM = 3
 
     FEATURES = [
         HERO_STATE_DIM,
         STATION_DIM,
+        CHARGER_DIM,
+        NPC_DIM,
         LEGAL_ACT_DIM,
         INDICATOR_DIM,
     ]

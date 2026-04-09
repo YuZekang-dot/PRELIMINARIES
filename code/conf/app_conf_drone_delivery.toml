@@ -1,6 +1,37 @@
+# -----------------------------------------------------------------------------
+# 文件作用：项目级策略入口配置
+# -----------------------------------------------------------------------------
+# 这个文件决定“drone_delivery 这个项目默认跑哪套策略配置”。
+# 可以把它理解为项目层的总开关：
+# 1. 指定当前项目使用哪个 RL helper；
+# 2. 指定某个 policy 槽位最终绑定哪个算法名；
+# 3. 这里写的 algo 名称，必须能在 algo_conf_drone_delivery.toml 中找到同名配置段。
+#
+# 三个配置文件的分工如下：
+# - app_conf_drone_delivery.toml：选择项目默认使用哪种算法
+# - algo_conf_drone_delivery.toml：把算法名映射到具体的 agent / workflow Python 实现
+# - configure_app.toml：配置训练运行时参数，如样本池、batch size、模型保存与预加载
+#
+# 如果你只是想切换默认算法（例如从 ppo 切到 diy），优先修改本文件中的：
+#   algo = "ppo"
+# 改成：
+#   algo = "diy"
+# 前提是 algo_conf_drone_delivery.toml 里已经定义了 [diy] 段。
+# -----------------------------------------------------------------------------
+
 [drone_delivery]
+# RL helper：项目接入 KaiwuDRL 的入口辅助类。
+# 一般情况下不需要修改，除非你要替换整套环境/训练接入方式。
 rl_helper = "kaiwudrl.server.aisrv.kaiwu_rl_helper_standard.KaiWuRLStandardHelper"
 
 [drone_delivery.policies.train_one]
+# policy_builder：策略构建器。
+# 这里使用异步策略构建方式，交由框架在训练/预测服务中组装策略实例。
 policy_builder = "kaiwudrl.server.aisrv.async_policy.AsyncBuilder"
+
+# algo：当前 policy 槽位绑定的算法名。
+# 这个名字不是 Python 文件名，而是“算法配置别名”：
+# - 写成 "ppo" 时，会去 algo_conf_drone_delivery.toml 中读取 [ppo] 段
+# - 写成 "diy" 时，会去 algo_conf_drone_delivery.toml 中读取 [diy] 段
+# 当前仓库默认使用 PPO 基线。
 algo = "ppo"

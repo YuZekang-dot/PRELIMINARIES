@@ -1,12 +1,48 @@
+# -----------------------------------------------------------------------------
+# 文件作用：算法名 -> 具体 Python 实现 的映射表
+# -----------------------------------------------------------------------------
+# 这个文件负责回答一个问题：
+# “当 app_conf_drone_delivery.toml 里写 algo = 'ppo' 或 algo = 'diy' 时，
+#  框架应该去加载哪些 Agent、Workflow 实现？”
+#
+# 也就是说：
+# - app_conf 负责“选算法名”
+# - 本文件负责“算法名对应到哪一组代码入口”
+#
+# 每个配置段（如 [ppo] / [diy]）代表一种算法实现。
+# 段名必须与 app_conf_drone_delivery.toml 中的 algo 字段保持一致。
+#
+# 字段说明：
+# - actor_agent：Actor 服务使用的智能体类
+# - learner_agent：Learner 服务使用的智能体类
+# - aisrv_agent：Aisrv 侧使用的智能体类
+# - train_workflow：训练任务入口工作流
+# - eval_workflow：评估任务入口工作流
+# - exam_workflow：考试/测评任务入口工作流
+#
+# 这些值都是 Python 导入路径，修改时必须保证路径真实存在且可导入。
+# -----------------------------------------------------------------------------
+
 [ppo]
+# PPO 基线算法配置。
+# 当前仓库默认训练就是通过 app_conf 中的 algo = "ppo" 指向本段。
 actor_agent = "agent_ppo.agent.Agent"
 learner_agent = "agent_ppo.agent.Agent"
 aisrv_agent = "agent_ppo.agent.Agent"
+
+# train_workflow：训练时实际执行的工作流入口。
+# PPO 的环境交互、采样、样本发送等逻辑在这里实现。
 train_workflow = "agent_ppo.workflow.train_workflow.workflow"
+
+# eval_workflow / exam_workflow：
+# 评估与考试通常沿用框架提供的通用流程，调用 agent.exploit() 完成决策。
 eval_workflow = "tools.eval.workflow.eval_workflow.workflow"
 exam_workflow = "tools.eval.workflow.exam_workflow.workflow"
 
 [diy]
+# DIY 自定义算法模板配置。
+# 如果你想自己实现一套算法，可以把 app_conf 中的 algo 改为 "diy"，
+# 然后补全 agent_diy 目录下的模型、算法、特征处理和工作流代码。
 actor_agent = "agent_diy.agent.Agent"
 learner_agent = "agent_diy.agent.Agent"
 aisrv_agent = "agent_diy.agent.Agent"
