@@ -124,7 +124,7 @@ class EpisodeRunner:
                 _obs_data, _remain_info = self.agent.observation_process(env_obs)
 
                 # Reward (from preprocessor, single channel) / 奖励（来自 preprocessor，单通道 list[float]）
-                reward = np.array(self.agent.preprocessor._reward_process(), dtype=np.float32)
+                reward = np.array(_remain_info["reward"], dtype=np.float32)
 
                 total_reward_sum += float(reward.sum())
 
@@ -135,9 +135,9 @@ class EpisodeRunner:
                     total_score = env_obs["observation"]["env_info"].get("total_score", 0)
 
                     if terminated:
-                        # Abnormal termination (collision or energy depleted): small penalty
-                        # 异常终止（碰撞 or 电量耗尽）：给小惩罚
-                        final_reward[0] = -1.0
+                        # Terminal penalty is now handled in preprocessor reward logic.
+                        # 终局惩罚已下沉到 preprocessor 的奖励逻辑中，这里不再重复惩罚。
+                        final_reward[0] = 0.0
                         result_str = "FAIL"
                     else:
                         # Normal end: reached max steps
