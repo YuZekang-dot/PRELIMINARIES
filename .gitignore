@@ -24,6 +24,8 @@ models/
 outputs/
 runs/
 wandb/
+train/log/
+train/backup_model/
 
 # OS files
 .DS_Store

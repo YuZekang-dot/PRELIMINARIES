@@ -48,7 +48,7 @@ def _get_entity_feature(found, cur_pos, target_pos, extra_flag=0.0):
     relative_pos = (target_pos[0] - cur_pos[0], target_pos[1] - cur_pos[1])
     euclid_dist = np.sqrt(relative_pos[0] ** 2 + relative_pos[1] ** 2)
     chebyshev_dist = max(abs(relative_pos[0]), abs(relative_pos[1]))
-    abs_norm = norm(np.array(target_pos), 128, -128)
+    abs_norm = norm(np.array(target_pos), Config.MAX_COORD, 0)
     return np.array(
         [
             float(found),
@@ -56,10 +56,54 @@ def _get_entity_feature(found, cur_pos, target_pos, extra_flag=0.0):
             norm(relative_pos[1] / max(euclid_dist, 1e-4), 1, -1),
             abs_norm[0],
             abs_norm[1],
-            norm(chebyshev_dist, 128),
+            norm(chebyshev_dist, Config.MAX_CHEBYSHEV_DIST),
             float(extra_flag),
         ]
     )
+
+
+def _get_rect_bounds(center_pos, width, height):
+    """Build rectangle bounds from center position and extent.
+
+    基于中心点和宽高生成矩形边界。
+    """
+    half_w = max(float(width) - 1.0, 0.0) / 2.0
+    half_h = max(float(height) - 1.0, 0.0) / 2.0
+    return (
+        center_pos[0] - half_w,
+        center_pos[0] + half_w,
+        center_pos[1] - half_h,
+        center_pos[1] + half_h,
+    )
+
+
+def _clip_to_rect(pos, rect_bounds):
+    """Project a position to the nearest point in the rectangle.
+
+    把位置投影到矩形区域上的最近点。
+    """
+    if rect_bounds is None:
+        return pos
+
+    x_min, x_max, z_min, z_max = rect_bounds
+    return (
+        float(np.clip(pos[0], x_min, x_max)),
+        float(np.clip(pos[1], z_min, z_max)),
+    )
+
+
+def _chebyshev_distance_to_rect(pos, rect_bounds):
+    """Chebyshev distance from a point to an axis-aligned rectangle.
+
+    点到轴对齐矩形区域的最小 Chebyshev 距离。
+    """
+    if pos is None or rect_bounds is None:
+        return float("inf")
+
+    x_min, x_max, z_min, z_max = rect_bounds
+    dx = max(x_min - pos[0], 0.0, pos[0] - x_max)
+    dz = max(z_min - pos[1], 0.0, pos[1] - z_max)
+    return max(dx, dz)
 
 
 class Preprocessor:
@@ -103,6 +147,7 @@ class Preprocessor:
         self.mode = None
         self.target_id = None
         self.target_pos = None
+        self.target_bounds = None
 
         # Previous snapshot / 上一时刻快照
         self.prev_pos = None
@@ -113,6 +158,7 @@ class Preprocessor:
         self.prev_mode = None
         self.prev_target_id = None
         self.prev_target_pos = None
+        self.prev_target_bounds = None
         self.prev_nearest_npc_dist = None
 
     def _parse_obs(self, env_obs):
@@ -165,9 +211,9 @@ class Preprocessor:
         self.env_legal_act = obs.get("legal_action", [1] * Config.ACTION_NUM)
 
     def feature_process(self, env_obs, last_action):
-        """Core feature extraction. Returns (feature_50d, legal_action, reward).
+        """Core feature extraction. Returns (feature, legal_action, reward).
 
-        核心特征提取方法，返回 50 维特征向量、合法动作掩码和奖励。
+        核心特征提取方法，返回完整特征向量、合法动作掩码和奖励。
         """
         self._parse_obs(env_obs)
         self._update_goal_state()
@@ -175,7 +221,7 @@ class Preprocessor:
         # 1. Hero state features (4D) / 英雄状态特征（4D）
         battery_ratio = norm(self.battery, self.battery_max)
         package_count_norm = norm(len(self.packages), 3)
-        cur_pos_norm = norm(np.array(self.cur_pos, dtype=float), 128, -128)
+        cur_pos_norm = norm(np.array(self.cur_pos, dtype=float), Config.MAX_COORD, 0)
         hero_feat = np.array(
             [
                 battery_ratio,
@@ -193,7 +239,7 @@ class Preprocessor:
 
         def station_sort_key(s):
             is_tgt = s.get("config_id", 0) in target_ids
-            dist = self._chebyshev_distance(self.cur_pos, (s["pos"]["x"], s["pos"]["z"]))
+            dist = self._get_region_distance(self.cur_pos, self._get_station_bounds(s))
             return (0 if is_tgt else 1, dist)
 
         sorted_stations = sorted(self.stations, key=station_sort_key)
@@ -219,7 +265,7 @@ class Preprocessor:
         # 3. Nearest 1 charger feature (7D) / 最近 1 个充电桩特征（7D）
         sorted_chargers = sorted(
             self.chargers,
-            key=lambda c: self._chebyshev_distance(self.cur_pos, (c["pos"]["x"], c["pos"]["z"])),
+            key=lambda c: self._get_region_distance(self.cur_pos, self._get_charger_bounds(c)),
         )
         if len(sorted_chargers) > 0:
             c = sorted_chargers[0]
@@ -257,7 +303,19 @@ class Preprocessor:
         has_package = 1.0 if len(self.packages) > 0 else 0.0
         indicators = np.array([has_package, battery_low, target_visible])
 
-        # Concatenate features (Total 50D / 合计 50D)
+        # 7. Warehouse feature (5D) / 仓库特征（5D）
+        warehouse_feat = self._get_warehouse_feature()
+
+        # 8. Mode feature (4D) / 模式 one-hot（4D）
+        mode_feat = self._get_mode_feature()
+
+        # 9. Target feature (5D) / 当前目标特征（5D）
+        target_feat = self._get_target_feature()
+
+        # 10. Local spatial map (21x21x3) / 局部空间图（21x21x3）
+        local_map_feat = self._get_local_map_feature()
+
+        # Concatenate features / 拼接标量特征 + 局部地图特征
         feature = np.concatenate(
             [
                 hero_feat,
@@ -266,6 +324,10 @@ class Preprocessor:
                 npc_feat,
                 np.array(legal_action, dtype=float),
                 indicators,
+                warehouse_feat,
+                mode_feat,
+                target_feat,
+                local_map_feat,
             ]
         )
 
@@ -289,6 +351,24 @@ class Preprocessor:
             return Config.PROGRESS_REWARD_WAREHOUSE_CHARGE
         return 0.0
 
+    def _get_direction_feature(self, from_pos, to_pos):
+        """Encode direction from one position to another as 2D normalized feature.
+
+        把从起点指向终点的方向编码为二维归一化特征。
+        """
+        if from_pos is None or to_pos is None:
+            return np.array([0.5, 0.5], dtype=float)
+
+        relative_pos = (to_pos[0] - from_pos[0], to_pos[1] - from_pos[1])
+        euclid_dist = np.sqrt(relative_pos[0] ** 2 + relative_pos[1] ** 2)
+        return np.array(
+            [
+                norm(relative_pos[0] / max(euclid_dist, 1e-4), 1, -1),
+                norm(relative_pos[1] / max(euclid_dist, 1e-4), 1, -1),
+            ],
+            dtype=float,
+        )
+
     def _get_organ_pos(self, organ):
         """Extract organ position.
 
@@ -297,6 +377,243 @@ class Preprocessor:
         # Assume organ["pos"] is already the semantic center point.
         # 假设 organ["pos"] 本身就是语义中心点，不再使用 w/h 做额外偏移。
         return (float(organ["pos"]["x"]), float(organ["pos"]["z"]))
+
+    def _get_station_bounds(self, station):
+        """Get station area bounds.
+
+        获取驿站矩形区域边界。
+        """
+        if station is None:
+            return None
+        return _get_rect_bounds(self._get_organ_pos(station), width=3.0, height=3.0)
+
+    def _get_charger_bounds(self, charger):
+        """Get charger area bounds.
+
+        获取充电桩作用区域边界。
+        """
+        if charger is None:
+            return None
+
+        center_pos = self._get_organ_pos(charger)
+        charge_radius = max(float(charger.get("range", 1.0)), 1.0)
+        return (
+            center_pos[0] - charge_radius,
+            center_pos[0] + charge_radius,
+            center_pos[1] - charge_radius,
+            center_pos[1] + charge_radius,
+        )
+
+    def _get_warehouse_bounds(self, warehouse):
+        """Get warehouse area bounds.
+
+        获取仓库区域边界。
+        """
+        if warehouse is None:
+            return None
+
+        center_pos = self._get_organ_pos(warehouse)
+        width = max(float(warehouse.get("w", 1.0)), 1.0)
+        height = max(float(warehouse.get("h", 1.0)), 1.0)
+        return _get_rect_bounds(center_pos, width=width, height=height)
+
+    def _get_region_distance(self, pos, rect_bounds):
+        """Chebyshev distance from a position to a region.
+
+        位置到区域的最小 Chebyshev 距离。
+        """
+        return _chebyshev_distance_to_rect(pos, rect_bounds)
+
+    def _get_target_region_distance(self, pos, target_bounds=None, target_pos=None):
+        """Distance from a position to the current target region.
+
+        位置到当前目标区域的最小 Chebyshev 距离。
+        """
+        if target_bounds is not None:
+            return self._get_region_distance(pos, target_bounds)
+        if target_pos is not None:
+            return self._chebyshev_distance(pos, target_pos)
+        return float("inf")
+
+    def _get_target_projection(self, target_bounds=None, target_pos=None):
+        """Get the nearest point on target region from current position.
+
+        获取当前点投影到目标区域上的最近点。
+        """
+        if target_bounds is not None:
+            return _clip_to_rect(self.cur_pos, target_bounds)
+        return target_pos if target_pos is not None else self.cur_pos
+
+    def _get_warehouse_feature(self):
+        """Build explicit warehouse feature.
+
+        构造显式仓库特征。
+        """
+        warehouse, warehouse_pos, _ = self._get_nearest_warehouse()
+        if warehouse is None or warehouse_pos is None:
+            return np.zeros(Config.WAREHOUSE_DIM, dtype=float)
+
+        warehouse_bounds = self._get_warehouse_bounds(warehouse)
+        warehouse_pos_norm = norm(np.array(warehouse_pos, dtype=float), Config.MAX_COORD, 0)
+        warehouse_h_norm = norm(float(warehouse.get("h", 1.0)), Config.MAP_SIZE, 0)
+        warehouse_w_norm = norm(float(warehouse.get("w", 1.0)), Config.MAP_SIZE, 0)
+        warehouse_dist = self._get_region_distance(self.cur_pos, warehouse_bounds)
+
+        return np.array(
+            [
+                warehouse_pos_norm[0],
+                warehouse_pos_norm[1],
+                warehouse_h_norm,
+                warehouse_w_norm,
+                norm(warehouse_dist, Config.MAX_CHEBYSHEV_DIST),
+            ],
+            dtype=float,
+        )
+
+    def _get_mode_feature(self):
+        """Build one-hot mode feature.
+
+        构造模式 one-hot 特征。
+        """
+        feat = np.zeros(Config.MODE_DIM, dtype=float)
+        mode_to_idx = {
+            MODE_WAREHOUSE_REFILL: 0,
+            MODE_STATION: 1,
+            MODE_CHARGER: 2,
+            MODE_WAREHOUSE_CHARGE: 3,
+        }
+        if self.mode in mode_to_idx:
+            feat[mode_to_idx[self.mode]] = 1.0
+        return feat
+
+    def _get_target_feature(self):
+        """Build explicit current target feature.
+
+        构造显式当前目标特征。
+        """
+        target_pos = self.target_pos
+        target_bounds = self.target_bounds
+        if target_pos is None and target_bounds is None:
+            return np.zeros(Config.TARGET_DIM, dtype=float)
+
+        target_proj = self._get_target_projection(target_bounds=target_bounds, target_pos=target_pos)
+        direction_feat = self._get_direction_feature(self.cur_pos, target_proj)
+        if target_pos is None:
+            target_pos = target_proj
+        target_abs_norm = norm(np.array(target_pos, dtype=float), Config.MAX_COORD, 0)
+        target_dist = self._get_target_region_distance(
+            self.cur_pos,
+            target_bounds=target_bounds,
+            target_pos=target_pos,
+        )
+
+        return np.array(
+            [
+                direction_feat[0],
+                direction_feat[1],
+                target_abs_norm[0],
+                target_abs_norm[1],
+                norm(target_dist, Config.MAX_CHEBYSHEV_DIST),
+            ],
+            dtype=float,
+        )
+
+    def _get_local_grid(self):
+        """Return local 21x21 traversability grid as float array.
+
+        返回局部 21x21 可通行网格。
+        """
+        grid = self.map_info
+        if not isinstance(grid, list) or len(grid) != Config.LOCAL_MAP_SIDE:
+            return np.zeros((Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE), dtype=np.float32)
+
+        grid_np = np.array(grid, dtype=np.float32)
+        if grid_np.shape != (Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE):
+            return np.zeros((Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE), dtype=np.float32)
+        return np.clip(grid_np, 0.0, 1.0)
+
+    def _npc_danger_value(self, dist):
+        """Reward-inspired NPC danger kernel in [0, 1].
+
+        基于奖励衰减核的 NPC 风险值。
+        """
+        if dist > Config.NPC_PENALTY_RADIUS:
+            return 0.0
+        return float(np.exp(-(max(dist, 1.0) - 1.0) / 1.5))
+
+    def _get_local_npc_danger_map(self):
+        """Build local NPC danger map.
+
+        构造局部 NPC 风险图。
+        """
+        danger_map = np.zeros((Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE), dtype=np.float32)
+        if len(self.npcs) == 0:
+            return danger_map
+
+        for row in range(Config.LOCAL_MAP_SIDE):
+            global_z = self.cur_pos[1] + (row - Config.LOCAL_MAP_RADIUS)
+            for col in range(Config.LOCAL_MAP_SIDE):
+                global_x = self.cur_pos[0] + (col - Config.LOCAL_MAP_RADIUS)
+                cell_pos = (global_x, global_z)
+                cell_danger = 0.0
+                for npc in self.npcs:
+                    npc_pos = (npc["pos"]["x"], npc["pos"]["z"])
+                    dist = self._chebyshev_distance(cell_pos, npc_pos)
+                    cell_danger = max(cell_danger, self._npc_danger_value(dist))
+                danger_map[row, col] = cell_danger
+
+        return danger_map
+
+    def _get_local_target_potential_map(self):
+        """Build local target potential map in [0, 1].
+
+        构造局部目标势场图。
+        """
+        target_bounds = self.target_bounds
+        target_pos = self.target_pos
+        if target_bounds is None and target_pos is None:
+            return np.zeros((Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE), dtype=np.float32)
+
+        current_dist = self._get_target_region_distance(
+            self.cur_pos,
+            target_bounds=target_bounds,
+            target_pos=target_pos,
+        )
+        if not np.isfinite(current_dist):
+            return np.zeros((Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE), dtype=np.float32)
+
+        potential_map = np.zeros((Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE), dtype=np.float32)
+        scale = float(max(Config.LOCAL_MAP_RADIUS, 1))
+        for row in range(Config.LOCAL_MAP_SIDE):
+            global_z = self.cur_pos[1] + (row - Config.LOCAL_MAP_RADIUS)
+            for col in range(Config.LOCAL_MAP_SIDE):
+                global_x = self.cur_pos[0] + (col - Config.LOCAL_MAP_RADIUS)
+                cell_pos = (global_x, global_z)
+                cell_dist = self._get_target_region_distance(
+                    cell_pos,
+                    target_bounds=target_bounds,
+                    target_pos=target_pos,
+                )
+                improvement = np.clip((current_dist - cell_dist) / scale, -1.0, 1.0)
+                potential_map[row, col] = 0.5 * (improvement + 1.0)
+
+        return potential_map
+
+    def _get_local_map_feature(self):
+        """Build flattened 21x21x3 local map feature.
+
+        构造展平后的 21x21x3 局部地图特征。
+        """
+        traversable_grid = self._get_local_grid()
+        obstacle_map = 1.0 - traversable_grid
+        npc_danger_map = self._get_local_npc_danger_map()
+        target_potential_map = self._get_local_target_potential_map()
+
+        local_map = np.stack(
+            [obstacle_map, npc_danger_map, target_potential_map],
+            axis=0,
+        ).astype(np.float32)
+        return local_map.reshape(-1)
 
     def _chebyshev_distance(self, pos_a, pos_b):
         """Chebyshev distance under 8-neighbor movement.
@@ -307,14 +624,19 @@ class Preprocessor:
             return float("inf")
         return max(abs(pos_a[0] - pos_b[0]), abs(pos_a[1] - pos_b[1]))
 
-    def _can_reach_target(self, target_pos):
-        """Check whether current battery can reach the target position.
+    def _can_reach_target(self, target_pos=None, target_bounds=None):
+        """Check whether current battery can reach the target position or region.
 
-        判断当前电量是否足以到达目标位置。
+        判断当前电量是否足以到达目标位置或区域。
         """
-        if target_pos is None:
+        dist = self._get_target_region_distance(
+            self.cur_pos,
+            target_bounds=target_bounds,
+            target_pos=target_pos,
+        )
+        if not np.isfinite(dist):
             return False
-        return self.battery >= self._chebyshev_distance(self.cur_pos, target_pos)
+        return self.battery >= dist
 
     def _get_nearest_charger(self, from_pos=None):
         """Get nearest charger from a position.
@@ -328,10 +650,11 @@ class Preprocessor:
 
         charger = min(
             self.chargers,
-            key=lambda c: self._chebyshev_distance(from_pos, self._get_organ_pos(c)),
+            key=lambda c: self._get_region_distance(from_pos, self._get_charger_bounds(c)),
         )
         charger_pos = self._get_organ_pos(charger)
-        return charger, charger_pos, self._chebyshev_distance(from_pos, charger_pos)
+        charger_dist = self._get_region_distance(from_pos, self._get_charger_bounds(charger))
+        return charger, charger_pos, charger_dist
 
     def _get_nearest_warehouse(self, from_pos=None):
         """Get nearest warehouse from a position.
@@ -345,10 +668,11 @@ class Preprocessor:
 
         warehouse = min(
             self.warehouses,
-            key=lambda w: self._chebyshev_distance(from_pos, self._get_organ_pos(w)),
+            key=lambda w: self._get_region_distance(from_pos, self._get_warehouse_bounds(w)),
         )
         warehouse_pos = self._get_organ_pos(warehouse)
-        return warehouse, warehouse_pos, self._chebyshev_distance(from_pos, warehouse_pos)
+        warehouse_dist = self._get_region_distance(from_pos, self._get_warehouse_bounds(warehouse))
+        return warehouse, warehouse_pos, warehouse_dist
 
     def _get_station_by_id(self, target_id):
         """Find station organ by config_id.
@@ -382,7 +706,7 @@ class Preprocessor:
 
         return min(
             target_stations,
-            key=lambda s: self._chebyshev_distance(self.cur_pos, self._get_organ_pos(s)),
+            key=lambda s: self._get_region_distance(self.cur_pos, self._get_station_bounds(s)),
         )
 
     def _get_nearest_charge_target(self, from_pos=None):
@@ -411,7 +735,8 @@ class Preprocessor:
             return False
 
         station_pos = self._get_organ_pos(station)
-        d_to_station = self._chebyshev_distance(self.cur_pos, station_pos)
+        station_bounds = self._get_station_bounds(station)
+        d_to_station = self._get_region_distance(self.cur_pos, station_bounds)
         _, _, _, d_retreat = self._get_nearest_charge_target(from_pos=station_pos)
         if not np.isfinite(d_retreat):
             return False
@@ -428,8 +753,13 @@ class Preprocessor:
             return False
 
         if self.mode == MODE_WAREHOUSE_REFILL:
-            _, warehouse_pos, _ = self._get_nearest_warehouse()
-            return self.package_count == 0 and warehouse_pos is not None and self._can_reach_target(warehouse_pos)
+            warehouse, warehouse_pos, _ = self._get_nearest_warehouse()
+            warehouse_bounds = self._get_warehouse_bounds(warehouse)
+            return (
+                self.package_count == 0
+                and warehouse_pos is not None
+                and self._can_reach_target(target_pos=warehouse_pos, target_bounds=warehouse_bounds)
+            )
 
         if self.mode == MODE_STATION:
             return self.target_id in set(self.packages) and self._get_station_by_id(self.target_id) is not None
@@ -450,14 +780,18 @@ class Preprocessor:
         if self.mode == MODE_STATION:
             station = self._get_station_by_id(self.target_id)
             self.target_pos = self._get_organ_pos(station) if station is not None else None
+            self.target_bounds = self._get_station_bounds(station)
         elif self.mode == MODE_CHARGER:
             charger = self._get_charger_by_id(self.target_id)
             self.target_pos = self._get_organ_pos(charger) if charger is not None else None
+            self.target_bounds = self._get_charger_bounds(charger)
         elif self.mode in (MODE_WAREHOUSE_REFILL, MODE_WAREHOUSE_CHARGE):
-            _, warehouse_pos, _ = self._get_nearest_warehouse()
+            warehouse, warehouse_pos, _ = self._get_nearest_warehouse()
             self.target_pos = warehouse_pos
+            self.target_bounds = self._get_warehouse_bounds(warehouse)
         else:
             self.target_pos = None
+            self.target_bounds = None
 
     def _should_replan(self):
         """Determine whether the goal should be reselected.
@@ -491,11 +825,13 @@ class Preprocessor:
         根据当前任务状态选择新的锁定目标。
         """
         if self.package_count == 0:
-            _, warehouse_pos, _ = self._get_nearest_warehouse()
-            if warehouse_pos is not None and self._can_reach_target(warehouse_pos):
+            warehouse, warehouse_pos, _ = self._get_nearest_warehouse()
+            warehouse_bounds = self._get_warehouse_bounds(warehouse)
+            if warehouse_pos is not None and self._can_reach_target(target_pos=warehouse_pos, target_bounds=warehouse_bounds):
                 self.mode = MODE_WAREHOUSE_REFILL
                 self.target_id = "warehouse"
                 self.target_pos = warehouse_pos
+                self.target_bounds = warehouse_bounds
                 return
 
             charger, charger_pos, _ = self._get_nearest_charger()
@@ -503,11 +839,13 @@ class Preprocessor:
                 self.mode = MODE_CHARGER
                 self.target_id = charger.get("config_id", 0)
                 self.target_pos = charger_pos
+                self.target_bounds = self._get_charger_bounds(charger)
                 return
 
             self.mode = MODE_WAREHOUSE_REFILL
             self.target_id = "warehouse"
             self.target_pos = warehouse_pos
+            self.target_bounds = warehouse_bounds
             return
 
         station = self._get_nearest_target_station()
@@ -515,6 +853,7 @@ class Preprocessor:
             self.mode = MODE_STATION
             self.target_id = station.get("config_id", 0)
             self.target_pos = self._get_organ_pos(station)
+            self.target_bounds = self._get_station_bounds(station)
             return
 
         mode, target_id, target_pos, _ = self._get_nearest_charge_target()
@@ -522,17 +861,24 @@ class Preprocessor:
             self.mode = mode
             self.target_id = target_id
             self.target_pos = target_pos
+            if mode == MODE_CHARGER:
+                self.target_bounds = self._get_charger_bounds(self._get_charger_by_id(target_id))
+            else:
+                warehouse, _, _ = self._get_nearest_warehouse()
+                self.target_bounds = self._get_warehouse_bounds(warehouse)
             return
 
         if station is not None:
             self.mode = MODE_STATION
             self.target_id = station.get("config_id", 0)
             self.target_pos = self._get_organ_pos(station)
+            self.target_bounds = self._get_station_bounds(station)
             return
 
         self.mode = None
         self.target_id = None
         self.target_pos = None
+        self.target_bounds = None
 
     def _update_goal_state(self):
         """Update locked goal state with event-triggered replanning.
@@ -570,6 +916,7 @@ class Preprocessor:
         self.prev_mode = self.mode
         self.prev_target_id = self.target_id
         self.prev_target_pos = self.target_pos
+        self.prev_target_bounds = self.target_bounds
         self.prev_nearest_npc_dist = self._get_nearest_npc_distance()
 
     def _get_legal_action(self):
@@ -650,10 +997,21 @@ class Preprocessor:
         reward += Config.DELIVERY_REWARD_SCALE * newly_delivered
 
         # 2. Progress shaping / 锁定目标的势函数奖励
-        if self.mode == self.prev_mode and self.target_id == self.prev_target_id and self.target_pos is not None:
-            prev_dist = self._chebyshev_distance(self.prev_pos, self.target_pos)
-            cur_dist = self._chebyshev_distance(self.cur_pos, self.target_pos)
-            reward += self._get_progress_coef(self.mode) * np.clip(prev_dist - cur_dist, -1.0, 1.0)
+        if self.mode == self.prev_mode and self.target_id == self.prev_target_id:
+            target_bounds = self.target_bounds if self.target_bounds is not None else self.prev_target_bounds
+            target_pos = self.target_pos if self.target_pos is not None else self.prev_target_pos
+            prev_dist = self._get_target_region_distance(
+                self.prev_pos,
+                target_bounds=target_bounds,
+                target_pos=target_pos,
+            )
+            cur_dist = self._get_target_region_distance(
+                self.cur_pos,
+                target_bounds=target_bounds,
+                target_pos=target_pos,
+            )
+            if np.isfinite(prev_dist) and np.isfinite(cur_dist):
+                reward += self._get_progress_coef(self.mode) * np.clip(prev_dist - cur_dist, -1.0, 1.0)
 
         # 3. Charge event / 充电事件奖励
         if charge_event and self.prev_mode == MODE_CHARGER:

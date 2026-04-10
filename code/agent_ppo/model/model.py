@@ -63,14 +63,48 @@ class Model(nn.Module):
         self.model_name = "drone_delivery"
         self.device = device
 
-        feature_len = Config.FEATURE_LEN
         action_num = Config.ACTION_NUM
         value_num = Config.VALUE_NUM
         hidden_dim = 64
+        fusion_dim = 128
 
-        # Backbone network / 主干网络
+        self.vector_feature_len = Config.VECTOR_FEATURE_LEN
+        self.local_map_channels = Config.LOCAL_MAP_CHANNELS
+        self.local_map_side = Config.LOCAL_MAP_SIDE
+
+        # Vector branch / 标量特征分支
+        self.vector_encoder = MLP(
+            [self.vector_feature_len, hidden_dim, hidden_dim],
+            "vector",
+            non_linearity_last=True,
+        )
+
+        # Spatial branch / 局部地图分支
+        self.spatial_encoder = nn.Sequential(
+            nn.Conv2d(self.local_map_channels, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        for module in self.spatial_encoder:
+            if isinstance(module, nn.Conv2d):
+                nn.init.orthogonal_(module.weight)
+                nn.init.zeros_(module.bias)
+
+        self.spatial_proj = MLP(
+            [32 * 5 * 5, hidden_dim],
+            "spatial",
+            non_linearity_last=True,
+        )
+
+        # Fusion backbone / 融合主干
         self.backbone = MLP(
-            [feature_len, hidden_dim, hidden_dim],
+            [hidden_dim * 2, fusion_dim, hidden_dim],
             "backbone",
             non_linearity_last=True,
         )
@@ -88,7 +122,21 @@ class Model(nn.Module):
         前向传播。
         """
         feat = s.to(torch.float32)
-        hidden = self.backbone(feat)
+        vector_feat = feat[:, : self.vector_feature_len]
+        local_map_feat = feat[:, self.vector_feature_len :]
+        local_map_feat = local_map_feat.view(
+            -1,
+            self.local_map_channels,
+            self.local_map_side,
+            self.local_map_side,
+        )
+
+        vector_hidden = self.vector_encoder(vector_feat)
+        spatial_hidden = self.spatial_encoder(local_map_feat)
+        spatial_hidden = spatial_hidden.reshape(spatial_hidden.shape[0], -1)
+        spatial_hidden = self.spatial_proj(spatial_hidden)
+
+        hidden = self.backbone(torch.cat([vector_hidden, spatial_hidden], dim=1))
         logits = self.actor_head(hidden)
         value = self.critic_head(hidden)
         return [logits, value]

@@ -13,6 +13,14 @@ Drone Delivery PPO configuration.
 
 class Config:
 
+    # Map geometry / 地图几何
+    MAP_SIZE = 128
+    MAX_COORD = MAP_SIZE - 1
+    MAX_CHEBYSHEV_DIST = MAP_SIZE - 1
+    LOCAL_MAP_SIDE = 21
+    LOCAL_MAP_RADIUS = LOCAL_MAP_SIDE // 2
+    LOCAL_MAP_CHANNELS = 3
+
     # Feature dimensions / 特征维度
     HERO_STATE_DIM = 4
     STATION_FEAT_DIM = 7
@@ -22,17 +30,25 @@ class Config:
     NPC_DIM = 7
     LEGAL_ACT_DIM = 8
     INDICATOR_DIM = 3
+    WAREHOUSE_DIM = 5
+    MODE_DIM = 4
+    TARGET_DIM = 5
+    LOCAL_MAP_DIM = LOCAL_MAP_SIDE * LOCAL_MAP_SIDE * LOCAL_MAP_CHANNELS
 
-    FEATURES = [
+    VECTOR_FEATURES = [
         HERO_STATE_DIM,
         STATION_DIM,
         CHARGER_DIM,
         NPC_DIM,
         LEGAL_ACT_DIM,
         INDICATOR_DIM,
+        WAREHOUSE_DIM,
+        MODE_DIM,
+        TARGET_DIM,
     ]
-    FEATURE_SPLIT_SHAPE = FEATURES
-    FEATURE_LEN = sum(FEATURES)
+    VECTOR_FEATURE_LEN = sum(VECTOR_FEATURES)
+    FEATURE_SPLIT_SHAPE = VECTOR_FEATURES + [LOCAL_MAP_DIM]
+    FEATURE_LEN = VECTOR_FEATURE_LEN + LOCAL_MAP_DIM
     DIM_OF_OBSERVATION = FEATURE_LEN
 
     # Action space / 动作空间
