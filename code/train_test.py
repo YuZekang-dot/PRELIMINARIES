@@ -43,26 +43,25 @@ if __name__ == "__main__":
 
         # 下面这些键值会临时覆盖训练相关配置，目的是让测试更快触发训练流程。
         env_vars={
-            # 样本池容量设为 10：
-            # 正式训练时这个值通常较大；这里故意设得很小，
-            # 是为了让少量交互样本就能把样本池填到可训练状态。
+            # 样本池容量设为 10000：
+            # 当前采样慢于训练，容量保持中等，避免过多旧样本滞留。
             "replay_buffer_capacity": "10000",
 
-            # preload_ratio 设为 0.2：
-            # 表示样本池中只要有 20% 的数据就允许开始训练。
-            # 结合 replay_buffer_capacity = 10，相当于样本数达到约 2 条时即可触发训练，
-            # 能显著缩短自检等待时间。
-            "preload_ratio": "1.0",
+            # preload_ratio 设为 0.6：
+            # 样本池达到 60% 后启动训练，减少满池等待，同时保留足够 batch 多样性。
+            "preload_ratio": "0.6",
 
-            # 训练 batch size 设为 2：
-            # Learner 每次只取极小批量样本做一次更新，
-            # 这样在样本很少的情况下也能完成一次反向传播，
-            # 适合快速验证训练链路是否畅通。
-            "train_batch_size": "2048",
+            # 训练快于样本产出时限制重复消费，防止 ratio 继续升到 7+。
+            "reverb_rate_limiter": "SampleToInsertRatio",
+            "reverb_samples_per_insert": "2",
+            "reverb_error_buffer": "2048",
 
-            # dump_model_freq 设为 1：
-            # 表示训练步每推进 1 次就触发一次模型保存检查。
-            # 这样可以在 train_test 阶段顺便验证 save_model 逻辑是否正常。
+            # 训练 batch size 设为 1024：
+            # 降低 data_fetch 压力，让新 reward 下的策略更新更及时。
+            "train_batch_size": "1024",
+
+            # dump_model_freq 设为 100：
+            # 维持当前模型保存频率，避免在采样瓶颈下增加额外 I/O。
             "dump_model_freq": "100",
         },
     )

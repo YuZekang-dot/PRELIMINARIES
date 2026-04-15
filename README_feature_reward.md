@@ -197,22 +197,20 @@ danger(cell) = max_i exp(-(max(d_inf(cell, npc_i), 1) - 1) / 1.5)
 
 #### 2.8.3 通道 3：target potential map
 
-通道 3 表示当前局部区域中，每个格子相对当前目标的“接近潜力”。
+通道 3 表示当前局部区域中，每个格子相对当前 waypoint 的“接近潜力”。
 
-对于局部任意格子 `p`，定义：
+当前 waypoint 来自目标可见时的局部目标点，或来自全局 A* 路径中当前视野内 BFS 可达的前方路径点。对该 waypoint 反向做局部 BFS 后，定义：
 
 ```text
-improvement = clip((dist(cur, target_area) - dist(p, target_area)) / 10, -1, 1)
-target_potential = 0.5 * (improvement + 1.0)
+target_potential(p) = 1 - bfs_dist(p, waypoint) / max_reachable_bfs_dist
 ```
 
 其含义是：
 
-- 值大于 `0.5`：走到这个格子会更接近目标
-- 值约等于 `0.5`：与当前点接近程度相当
-- 值小于 `0.5`：走到这个格子会远离目标
+- 值越大：从该格子到 waypoint 的局部 BFS 距离越短
+- 不可达格子为 `0`
 
-这不是 reward 本身，而是目标势场的观测表达。
+这不是 reward 本身，而是局部导航势场的观测表达。
 
 ### 2.9 合法动作掩码
 
@@ -319,6 +317,41 @@ battery >= need
 
 - `SAFETY_MARGIN = 8.0`
 
+## 6.1 全局地图与重规划
+
+每局维护一张 `128x128` 全局地图，状态包括：
+
+- `GLOBAL_MAP_UNKNOWN = -1`
+- `GLOBAL_MAP_FREE = 0`
+- `GLOBAL_MAP_BLOCKED = 1`
+- `GLOBAL_MAP_PRIOR_FREE = 2`
+
+其中 `PRIOR_FREE` 是弱先验，只在仓库、驿站、充电桩区域仍为 `UNKNOWN` 时写入；真实 `map_info` 观测会覆盖该先验。A* 代价当前为：
+
+```text
+BLOCKED = inf
+FREE = 1.0
+PRIOR_FREE = 1.2
+UNKNOWN = 1.5
+```
+
+并额外叠加：
+
+```text
+cell_cost += VISIT_GLOBAL_COST_WEIGHT * visit_cost
+```
+
+全局 A* 不再维护 NPC 历史热点图，也不把 NPC 风险大范围加入全局路径代价。NPC 仍通过最近 NPC 标量特征、局部 `21x21` danger map 和 NPC 奖励项参与策略学习。
+
+全局路径不是每步重算，stuck 触发已扩展为：
+
+- 连续不移动
+- waypoint BFS 距离无进展
+- waypoint 连续脱离局部视野
+- 短窗口震荡
+- 重复访问且无进展
+- 当前位置偏离缓存全局路径过远
+
 ## 7. 当前奖励设计实现
 
 奖励函数位于 `code/agent_ppo/feature/preprocessor.py`，总体形式为：
@@ -326,12 +359,13 @@ battery >= need
 ```text
 r =
   delivery_reward
-  + progress_reward
+  + waypoint_progress_reward
+  + waypoint_reached_reward
+  - visitation_penalty
   + charge_event_reward
   + warehouse_event_reward
   - npc_penalty
   + npc_escape_reward
-  - block_penalty
   - step_penalty
   + terminal_penalty
 ```
@@ -355,10 +389,10 @@ mode_t == mode_{t-1}
 target_id_t == target_id_{t-1}
 ```
 
-并且距离不再使用“到目标点”的距离，而是“到目标区域的最小 Chebyshev 距离”：
+当前进度 shaping 使用 waypoint BFS 距离差，而不是全局直线距离：
 
 ```text
-progress_reward = alpha(mode) * clip(prev_dist_to_target_area - cur_dist_to_target_area, -1, 1)
+waypoint_progress_reward = alpha(mode) * clip(prev_bfs_dist_to_waypoint - cur_bfs_dist_to_waypoint, -1, 1)
 ```
 
 当前系数：
@@ -416,17 +450,39 @@ if d_npc <= 8:
     reward += 0.02 * clip(d_npc - d_prev, -1, 1)
 ```
 
-### 7.6 阻塞惩罚
+### 7.6 Waypoint 与访问惩罚
 
-若：
+当前进度奖励改为局部 BFS waypoint 进度。waypoint 优先取局部可达目标；目标不在局部可达范围内时，从缓存全局 A* 路径中选择当前 `21x21` 视野内、BFS 可达且距离不超过 `WAYPOINT_LOOKAHEAD_RADIUS` 的最远前方路径点。
 
-- `cur_pos == prev_pos`
-- 且本步没有 `charge_event`
-- 且本步没有 `warehouse_event`
+若当前 waypoint 和上一时刻 waypoint 一致：
 
-则施加阻塞惩罚：
+```text
+waypoint_progress_reward =
+    alpha(mode) * clip(prev_bfs_dist_to_waypoint - cur_bfs_dist_to_waypoint, -1, 1)
+```
 
-- `BLOCK_PENALTY = 0.01`
+到达 waypoint 时额外增加：
+
+- `WAYPOINT_REACHED_REWARD = 0.04`
+
+全局访问矩阵为 `128x128`，每局重置。访问惩罚为：
+
+```text
+visit_cost = min(visit_count[z][x], VISIT_COUNT_CAP) / VISIT_COUNT_CAP
+visitation_penalty = VISIT_PENALTY_SCALE * visit_cost
+```
+
+当前配置：
+
+- `WAYPOINT_REPLAN_STUCK_STEPS = 3`
+- `WAYPOINT_PROGRESS_TOL = 0.1`
+- `WAYPOINT_LOOKAHEAD_RADIUS = 8`
+- `NO_MOVE_STUCK_STEPS = 2`
+- `WAYPOINT_MISSING_REPLAN_STEPS = 2`
+- `PATH_DEVIATION_REPLAN_DIST = 4`
+- `VISIT_COUNT_CAP = 10`
+- `VISIT_PENALTY_SCALE = 0.01`
+- `VISIT_GLOBAL_COST_WEIGHT = 0.3`
 
 ### 7.7 每步惩罚
 

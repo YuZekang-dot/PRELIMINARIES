@@ -11,6 +11,9 @@ Drone Delivery feature preprocessor.
 """
 
 
+import heapq
+from collections import deque
+
 import numpy as np
 from agent_ppo.conf.conf import Config
 
@@ -148,6 +151,33 @@ class Preprocessor:
         self.target_id = None
         self.target_pos = None
         self.target_bounds = None
+        self.waypoint_pos = None
+        self.waypoint_goal_key = None
+        self.waypoint_bfs_dist = None
+        self.waypoint_no_improve_steps = 0
+        self.waypoint_stuck_replans = 0
+        self.waypoint_reached = False
+        self.completed_waypoint_pos = None
+        self.completed_waypoint_goal_key = None
+        self.completed_waypoint_cur_dist = None
+        self.local_bfs_distances = None
+        self.local_waypoint_distances = None
+        self.local_waypoint_distances_key = None
+        self.global_map = np.full(
+            (Config.MAP_SIZE, Config.MAP_SIZE),
+            Config.GLOBAL_MAP_UNKNOWN,
+            dtype=np.int8,
+        )
+        self.global_path = []
+        self.global_path_goal_key = None
+        self.global_path_cost = float("inf")
+        self.visit_count = np.zeros((Config.MAP_SIZE, Config.MAP_SIZE), dtype=np.int32)
+        self.last_visit_stamp = None
+        self.position_history = deque(maxlen=Config.OSCILLATION_WINDOW)
+        self.last_position_stamp = None
+        self.no_move_steps = 0
+        self.waypoint_missing_steps = 0
+        self.last_stuck_reasons = []
 
         # Previous snapshot / 上一时刻快照
         self.prev_pos = None
@@ -160,6 +190,9 @@ class Preprocessor:
         self.prev_target_pos = None
         self.prev_target_bounds = None
         self.prev_nearest_npc_dist = None
+        self.prev_waypoint_pos = None
+        self.prev_waypoint_goal_key = None
+        self.prev_waypoint_bfs_dist = None
 
     def _parse_obs(self, env_obs):
         """Parse essential fields from observation dict.
@@ -209,6 +242,13 @@ class Preprocessor:
         self.map_info = map_info
 
         self.env_legal_act = obs.get("legal_action", [1] * Config.ACTION_NUM)
+        self.local_bfs_distances = None
+        self.local_waypoint_distances = None
+        self.local_waypoint_distances_key = None
+        self._update_entity_prior_free()
+        self._update_global_map()
+        self._update_visit_count()
+        self._update_motion_stuck_state()
 
     def feature_process(self, env_obs, last_action):
         """Core feature extraction. Returns (feature, legal_action, reward).
@@ -217,6 +257,7 @@ class Preprocessor:
         """
         self._parse_obs(env_obs)
         self._update_goal_state()
+        self._update_waypoint_state()
 
         # 1. Hero state features (4D) / 英雄状态特征（4D）
         battery_ratio = norm(self.battery, self.battery_max)
@@ -532,6 +573,210 @@ class Preprocessor:
             return np.zeros((Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE), dtype=np.float32)
         return np.clip(grid_np, 0.0, 1.0)
 
+    def _has_valid_local_grid(self):
+        """Return whether the current local map has the expected shape."""
+        grid = self.map_info
+        if not isinstance(grid, list) or len(grid) != Config.LOCAL_MAP_SIDE:
+            return False
+        if any(not isinstance(row, list) or len(row) != Config.LOCAL_MAP_SIDE for row in grid):
+            return False
+        return True
+
+    def _local_cell_to_global_pos(self, row, col):
+        """Convert a local grid cell into global map coordinates."""
+        center = Config.LOCAL_MAP_RADIUS
+        return (
+            int(round(self.cur_pos[0])) + (col - center),
+            int(round(self.cur_pos[1])) + (row - center),
+        )
+
+    def _global_pos_to_local_cell(self, pos):
+        """Convert a global map coordinate into the current local grid cell."""
+        if pos is None:
+            return None
+        center = Config.LOCAL_MAP_RADIUS
+        row = center + (int(round(pos[1])) - int(round(self.cur_pos[1])))
+        col = center + (int(round(pos[0])) - int(round(self.cur_pos[0])))
+        if row < 0 or row >= Config.LOCAL_MAP_SIDE or col < 0 or col >= Config.LOCAL_MAP_SIDE:
+            return None
+        return row, col
+
+    def _to_grid_pos(self, pos):
+        """Convert a position-like value to an integer global cell."""
+        if pos is None:
+            return None
+        return (int(round(pos[0])), int(round(pos[1])))
+
+    def _update_global_map(self):
+        """Merge the current 21x21 local MapInfo into the per-episode global map."""
+        if not self._has_valid_local_grid():
+            return
+
+        grid = self._get_local_grid()
+        center = Config.LOCAL_MAP_RADIUS
+        base_x = int(round(self.cur_pos[0]))
+        base_z = int(round(self.cur_pos[1]))
+        for row in range(Config.LOCAL_MAP_SIDE):
+            global_z = base_z + (row - center)
+            if global_z < 0 or global_z >= Config.MAP_SIZE:
+                continue
+            for col in range(Config.LOCAL_MAP_SIDE):
+                global_x = base_x + (col - center)
+                if global_x < 0 or global_x >= Config.MAP_SIZE:
+                    continue
+                self.global_map[global_z, global_x] = (
+                    Config.GLOBAL_MAP_FREE if int(grid[row, col]) == 1 else Config.GLOBAL_MAP_BLOCKED
+                )
+
+        if 0 <= base_x < Config.MAP_SIZE and 0 <= base_z < Config.MAP_SIZE:
+            self.global_map[base_z, base_x] = Config.GLOBAL_MAP_FREE
+
+    def _iter_rect_cells(self, rect_bounds):
+        """Yield integer global cells covered by a rectangle."""
+        if rect_bounds is None:
+            return
+
+        x_min, x_max, z_min, z_max = rect_bounds
+        x0 = max(0, int(np.floor(x_min)))
+        x1 = min(Config.MAP_SIZE - 1, int(np.ceil(x_max)))
+        z0 = max(0, int(np.floor(z_min)))
+        z1 = min(Config.MAP_SIZE - 1, int(np.ceil(z_max)))
+        for z in range(z0, z1 + 1):
+            for x in range(x0, x1 + 1):
+                yield x, z
+
+    def _mark_prior_free_region(self, rect_bounds):
+        """Mark an entity region as weakly traversable without overriding observations."""
+        for x, z in self._iter_rect_cells(rect_bounds):
+            if self.global_map[z, x] == Config.GLOBAL_MAP_UNKNOWN:
+                self.global_map[z, x] = Config.GLOBAL_MAP_PRIOR_FREE
+
+    def _update_entity_prior_free(self):
+        """Seed known entity regions as weak free priors before map observations arrive."""
+        for warehouse in self.warehouses:
+            self._mark_prior_free_region(self._get_warehouse_bounds(warehouse))
+        for station in self.stations:
+            self._mark_prior_free_region(self._get_station_bounds(station))
+        for charger in self.chargers:
+            self._mark_prior_free_region(self._get_charger_bounds(charger))
+
+    def _get_visit_cost(self, pos):
+        """Normalized visit cost in [0, 1] for a global position."""
+        if pos is None:
+            return 0.0
+        x = int(round(pos[0]))
+        z = int(round(pos[1]))
+        if x < 0 or x >= Config.MAP_SIZE or z < 0 or z >= Config.MAP_SIZE:
+            return 0.0
+        return min(float(self.visit_count[z, x]), float(Config.VISIT_COUNT_CAP)) / max(
+            float(Config.VISIT_COUNT_CAP),
+            1.0,
+        )
+
+    def _is_in_global_map(self, pos):
+        """Return whether a global position is inside the fixed 128x128 map."""
+        if pos is None:
+            return False
+        x = int(round(pos[0]))
+        z = int(round(pos[1]))
+        return 0 <= x < Config.MAP_SIZE and 0 <= z < Config.MAP_SIZE
+
+    def _update_visit_count(self):
+        """Update per-episode global visit count once per observed step."""
+        x = int(round(self.cur_pos[0]))
+        z = int(round(self.cur_pos[1]))
+        if x < 0 or x >= Config.MAP_SIZE or z < 0 or z >= Config.MAP_SIZE:
+            return
+
+        stamp = (self.step_no, x, z)
+        if stamp == self.last_visit_stamp:
+            return
+
+        self.visit_count[z, x] += 1
+        self.last_visit_stamp = stamp
+
+    def _has_progress_event(self):
+        """Return whether this step has a delivery, charge, or warehouse event."""
+        charge_event = self.prev_charger_count is not None and self.charger_count > self.prev_charger_count
+        warehouse_event = self.prev_warehouse_count is not None and self.warehouse_count > self.prev_warehouse_count
+        delivery_event = self.prev_delivered is not None and self.delivered > self.prev_delivered
+        package_event = self.prev_package_count is not None and self.package_count != self.prev_package_count
+        return charge_event or warehouse_event or delivery_event or package_event
+
+    def _update_motion_stuck_state(self):
+        """Track recent movement patterns for faster stuck detection."""
+        cur_cell = self._to_grid_pos(self.cur_pos)
+        prev_cell = self._to_grid_pos(self.prev_pos)
+        progress_event = self._has_progress_event()
+
+        if cur_cell is not None and prev_cell is not None and cur_cell == prev_cell and not progress_event:
+            self.no_move_steps += 1
+        else:
+            self.no_move_steps = 0
+
+        stamp = (self.step_no, cur_cell)
+        if cur_cell is not None and stamp != self.last_position_stamp:
+            self.position_history.append(cur_cell)
+            self.last_position_stamp = stamp
+
+    def _get_local_bfs_distances(self):
+        """BFS distances from the current local-map center to all reachable cells."""
+        if self.local_bfs_distances is not None:
+            return self.local_bfs_distances
+
+        center = Config.LOCAL_MAP_RADIUS
+        self.local_bfs_distances = self._compute_local_bfs_distances((center, center))
+        return self.local_bfs_distances
+
+    def _is_local_passable(self, grid, row, col):
+        """Return whether a local-grid cell is passable."""
+        if row < 0 or row >= Config.LOCAL_MAP_SIDE or col < 0 or col >= Config.LOCAL_MAP_SIDE:
+            return False
+        return int(grid[row, col]) == 1
+
+    def _compute_local_bfs_distances(self, start_cell):
+        """BFS distances from a local-grid start cell to all reachable cells."""
+        inf = float("inf")
+        distances = np.full((Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE), inf, dtype=np.float32)
+        if start_cell is None or not self._has_valid_local_grid():
+            return distances
+
+        grid = self._get_local_grid()
+        start_row, start_col = start_cell
+        if not self._is_local_passable(grid, start_row, start_col):
+            return distances
+
+        distances[start_row, start_col] = 0.0
+        queue = deque([(start_row, start_col)])
+        while queue:
+            row, col = queue.popleft()
+            next_dist = distances[row, col] + 1.0
+            for dx, dz in ACTION_DELTAS:
+                next_row = row + dz
+                next_col = col + dx
+                if not self._is_local_passable(grid, next_row, next_col):
+                    continue
+                if dx != 0 and dz != 0 and not (
+                    self._is_local_passable(grid, row, col + dx) or self._is_local_passable(grid, row + dz, col)
+                ):
+                    continue
+                if next_dist < distances[next_row, next_col]:
+                    distances[next_row, next_col] = next_dist
+                    queue.append((next_row, next_col))
+
+        return distances
+
+    def _get_waypoint_distance_map(self):
+        """Reverse local BFS distances from the active waypoint to each local cell."""
+        waypoint_cell = self._global_pos_to_local_cell(self.waypoint_pos)
+        key = (self.waypoint_goal_key, self.waypoint_pos, waypoint_cell, self.step_no)
+        if self.local_waypoint_distances is not None and self.local_waypoint_distances_key == key:
+            return self.local_waypoint_distances
+
+        self.local_waypoint_distances = self._compute_local_bfs_distances(waypoint_cell)
+        self.local_waypoint_distances_key = key
+        return self.local_waypoint_distances
+
     def _npc_danger_value(self, dist):
         """Reward-inspired NPC danger kernel in [0, 1].
 
@@ -569,34 +814,22 @@ class Preprocessor:
 
         构造局部目标势场图。
         """
-        target_bounds = self.target_bounds
-        target_pos = self.target_pos
-        if target_bounds is None and target_pos is None:
+        if self.waypoint_pos is None:
             return np.zeros((Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE), dtype=np.float32)
 
-        current_dist = self._get_target_region_distance(
-            self.cur_pos,
-            target_bounds=target_bounds,
-            target_pos=target_pos,
-        )
-        if not np.isfinite(current_dist):
-            return np.zeros((Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE), dtype=np.float32)
-
+        waypoint_distances = self._get_waypoint_distance_map()
+        finite_mask = np.isfinite(waypoint_distances)
+        finite_scores = waypoint_distances[finite_mask]
         potential_map = np.zeros((Config.LOCAL_MAP_SIDE, Config.LOCAL_MAP_SIDE), dtype=np.float32)
-        scale = float(max(Config.LOCAL_MAP_RADIUS, 1))
-        for row in range(Config.LOCAL_MAP_SIDE):
-            global_z = self.cur_pos[1] + (row - Config.LOCAL_MAP_RADIUS)
-            for col in range(Config.LOCAL_MAP_SIDE):
-                global_x = self.cur_pos[0] + (col - Config.LOCAL_MAP_RADIUS)
-                cell_pos = (global_x, global_z)
-                cell_dist = self._get_target_region_distance(
-                    cell_pos,
-                    target_bounds=target_bounds,
-                    target_pos=target_pos,
-                )
-                improvement = np.clip((current_dist - cell_dist) / scale, -1.0, 1.0)
-                potential_map[row, col] = 0.5 * (improvement + 1.0)
+        if finite_scores.size == 0:
+            return potential_map
 
+        max_score = float(np.max(finite_scores))
+        if max_score <= 0.0:
+            potential_map[finite_mask] = 1.0
+            return potential_map
+
+        potential_map[finite_mask] = 1.0 - (waypoint_distances[finite_mask] / max_score)
         return potential_map
 
     def _get_local_map_feature(self):
@@ -623,6 +856,251 @@ class Preprocessor:
         if pos_a is None or pos_b is None:
             return float("inf")
         return max(abs(pos_a[0] - pos_b[0]), abs(pos_a[1] - pos_b[1]))
+
+    def _is_global_passable(self, pos):
+        """Return whether a global cell can be planned through."""
+        cell = self._to_grid_pos(pos)
+        if cell is None:
+            return False
+        x, z = cell
+        if x < 0 or x >= Config.MAP_SIZE or z < 0 or z >= Config.MAP_SIZE:
+            return False
+        return int(self.global_map[z, x]) != Config.GLOBAL_MAP_BLOCKED
+
+    def _get_global_cell_cost(self, pos):
+        """Cost of entering a global cell in A*."""
+        cell = self._to_grid_pos(pos)
+        if cell is None:
+            return float("inf")
+        x, z = cell
+        if x < 0 or x >= Config.MAP_SIZE or z < 0 or z >= Config.MAP_SIZE:
+            return float("inf")
+        cell_type = int(self.global_map[z, x])
+        if cell_type == Config.GLOBAL_MAP_BLOCKED:
+            return float("inf")
+        if cell_type == Config.GLOBAL_MAP_UNKNOWN:
+            base_cost = float(Config.GLOBAL_MAP_UNKNOWN_COST)
+        elif cell_type == Config.GLOBAL_MAP_PRIOR_FREE:
+            base_cost = float(Config.GLOBAL_MAP_PRIOR_FREE_COST)
+        else:
+            base_cost = float(Config.GLOBAL_MAP_FREE_COST)
+
+        visit_cost = float(Config.VISIT_GLOBAL_COST_WEIGHT) * self._get_visit_cost((x, z))
+        return base_cost + visit_cost
+
+    def _can_traverse_global_step(self, from_cell, to_cell):
+        """Return whether one global 8-neighbor step is passable."""
+        if not self._is_global_passable(to_cell):
+            return False
+
+        dx = int(to_cell[0]) - int(from_cell[0])
+        dz = int(to_cell[1]) - int(from_cell[1])
+        if dx == 0 and dz == 0:
+            return False
+        if abs(dx) > 1 or abs(dz) > 1:
+            return False
+        if dx != 0 and dz != 0:
+            horizontal_passable = self._is_global_passable((from_cell[0] + dx, from_cell[1]))
+            vertical_passable = self._is_global_passable((from_cell[0], from_cell[1] + dz))
+            return horizontal_passable or vertical_passable
+        return True
+
+    def _is_target_cell(self, cell):
+        """Return whether a global cell is inside the current target region."""
+        if cell is None:
+            return False
+        if self.target_bounds is not None:
+            return self._get_region_distance(cell, self.target_bounds) <= 0.0
+        if self.target_pos is not None:
+            return self._chebyshev_distance(cell, self._to_grid_pos(self.target_pos)) <= 0.0
+        return False
+
+    def _target_heuristic(self, cell):
+        """Admissible Chebyshev lower bound to the current target region."""
+        return self._get_target_region_distance(
+            cell,
+            target_bounds=self.target_bounds,
+            target_pos=self.target_pos,
+        )
+
+    def _clear_global_path(self):
+        """Clear the cached global A* plan."""
+        self.global_path = []
+        self.global_path_goal_key = None
+        self.global_path_cost = float("inf")
+
+    def _reconstruct_global_path(self, came_from, goal_cell):
+        """Reconstruct an A* path from the predecessor map."""
+        path = []
+        cell = goal_cell
+        while cell is not None:
+            path.append(cell)
+            cell = came_from.get(cell)
+        path.reverse()
+        return path
+
+    def _plan_global_path(self, goal_key):
+        """Plan a global A* path from the current cell to the current target region."""
+        if goal_key is None or (self.target_bounds is None and self.target_pos is None):
+            self._clear_global_path()
+            return False
+
+        start = self._to_grid_pos(self.cur_pos)
+        if start is None or not self._is_in_global_map(start):
+            self._clear_global_path()
+            return False
+
+        start_x, start_z = start
+        self.global_map[start_z, start_x] = Config.GLOBAL_MAP_FREE
+
+        if self._is_target_cell(start):
+            self.global_path = [start]
+            self.global_path_goal_key = goal_key
+            self.global_path_cost = 0.0
+            return True
+
+        start_h = self._target_heuristic(start)
+        if not np.isfinite(start_h):
+            self._clear_global_path()
+            return False
+
+        frontier = []
+        counter = 0
+        heapq.heappush(frontier, (start_h, 0.0, counter, start))
+        came_from = {start: None}
+        cost_so_far = {start: 0.0}
+
+        while frontier:
+            _, cur_cost, _, current = heapq.heappop(frontier)
+            if cur_cost > cost_so_far.get(current, float("inf")) + 1e-6:
+                continue
+
+            if self._is_target_cell(current):
+                self.global_path = self._reconstruct_global_path(came_from, current)
+                self.global_path_goal_key = goal_key
+                self.global_path_cost = cur_cost
+                return True
+
+            for dx, dz in ACTION_DELTAS:
+                next_cell = (current[0] + dx, current[1] + dz)
+                if not self._can_traverse_global_step(current, next_cell):
+                    continue
+
+                step_cost = self._get_global_cell_cost(next_cell)
+                if not np.isfinite(step_cost):
+                    continue
+
+                new_cost = cost_so_far[current] + step_cost
+                if new_cost >= cost_so_far.get(next_cell, float("inf")):
+                    continue
+
+                heuristic = self._target_heuristic(next_cell)
+                if not np.isfinite(heuristic):
+                    continue
+
+                cost_so_far[next_cell] = new_cost
+                came_from[next_cell] = current
+                counter += 1
+                heapq.heappush(frontier, (new_cost + heuristic, new_cost, counter, next_cell))
+
+        self._clear_global_path()
+        return False
+
+    def _get_current_path_index(self):
+        """Find the closest usable index on the cached global path."""
+        if len(self.global_path) == 0:
+            return 0
+
+        cur_cell = self._to_grid_pos(self.cur_pos)
+        if cur_cell is None:
+            return 0
+
+        best_idx = 0
+        best_dist = float("inf")
+        for idx, path_cell in enumerate(self.global_path):
+            dist = self._chebyshev_distance(cur_cell, path_cell)
+            if dist < best_dist or (dist == best_dist and idx > best_idx):
+                best_dist = dist
+                best_idx = idx
+        return best_idx
+
+    def _is_global_path_blocked(self):
+        """Return whether newly observed obstacles invalidate the cached path."""
+        if len(self.global_path) == 0:
+            return True
+
+        start_idx = self._get_current_path_index()
+        prev_cell = self.global_path[start_idx]
+        if not self._is_global_passable(prev_cell):
+            return True
+
+        for idx in range(start_idx + 1, len(self.global_path)):
+            cell = self.global_path[idx]
+            if not self._can_traverse_global_step(prev_cell, cell):
+                return True
+            prev_cell = cell
+        return False
+
+    def _get_path_deviation(self):
+        """Distance from current cell to the closest cached global path cell."""
+        if len(self.global_path) == 0:
+            return 0.0
+
+        cur_cell = self._to_grid_pos(self.cur_pos)
+        if cur_cell is None:
+            return 0.0
+
+        return min(self._chebyshev_distance(cur_cell, path_cell) for path_cell in self.global_path)
+
+    def _is_oscillation_stuck(self):
+        """Detect short-cycle movement such as A-B-A-B."""
+        if len(self.position_history) < Config.OSCILLATION_WINDOW:
+            return False
+        unique_count = len(set(self.position_history))
+        return (
+            unique_count <= Config.OSCILLATION_MIN_UNIQUE_POS
+            and self.waypoint_no_improve_steps >= 1
+            and not self._has_progress_event()
+        )
+
+    def _is_revisit_stuck(self):
+        """Detect repeated visits that also fail to make waypoint progress."""
+        return (
+            self._get_visit_cost(self.cur_pos) >= Config.REVISIT_STUCK_COST
+            and self.waypoint_no_improve_steps >= 1
+            and not self._has_progress_event()
+        )
+
+    def _should_force_global_replan(self, old_waypoint_valid):
+        """Decide whether local repair is too slow and A* should be forced now."""
+        reasons = []
+
+        if self.no_move_steps >= Config.NO_MOVE_STUCK_STEPS:
+            reasons.append("no_move")
+        if old_waypoint_valid and self.waypoint_no_improve_steps >= Config.WAYPOINT_REPLAN_STUCK_STEPS:
+            reasons.append("no_progress")
+        if self.waypoint_missing_steps >= Config.WAYPOINT_MISSING_REPLAN_STEPS:
+            reasons.append("waypoint_missing")
+        if self._is_oscillation_stuck():
+            reasons.append("oscillation")
+        if self._is_revisit_stuck():
+            reasons.append("revisit")
+        if len(self.global_path) > 0 and self._get_path_deviation() >= Config.PATH_DEVIATION_REPLAN_DIST:
+            reasons.append("path_deviation")
+
+        self.last_stuck_reasons = reasons
+        return len(reasons) > 0
+
+    def _ensure_global_path(self, goal_key, force=False):
+        """Keep a usable global path for the current goal."""
+        if (
+            force
+            or self.global_path_goal_key != goal_key
+            or len(self.global_path) == 0
+            or self._is_global_path_blocked()
+        ):
+            return self._plan_global_path(goal_key)
+        return True
 
     def _can_reach_target(self, target_pos=None, target_bounds=None):
         """Check whether current battery can reach the target position or region.
@@ -694,19 +1172,218 @@ class Preprocessor:
                 return charger
         return None
 
-    def _get_nearest_target_station(self):
+    def _lock_goal(self, mode, target_id, target_pos, target_bounds):
+        """Lock current goal fields in one place."""
+        old_goal_key = self._get_goal_key()
+        new_goal_key = None if mode is None or target_id is None else (mode, target_id)
+        target_changed = (
+            old_goal_key != new_goal_key
+            or self.target_pos != target_pos
+            or self.target_bounds != target_bounds
+        )
+        self.mode = mode
+        self.target_id = target_id
+        self.target_pos = target_pos
+        self.target_bounds = target_bounds
+        if target_changed:
+            self._clear_global_path()
+            self._clear_waypoint()
+            self.waypoint_no_improve_steps = 0
+            self.waypoint_stuck_replans = 0
+
+    def _clear_goal(self):
+        """Clear locked goal fields."""
+        self._lock_goal(None, None, None, None)
+
+    def _get_goal_key(self, mode=None, target_id=None):
+        """Build a stable key for tracking the current locked goal."""
+        mode = self.mode if mode is None else mode
+        target_id = self.target_id if target_id is None else target_id
+        if mode is None or target_id is None:
+            return None
+        return (mode, target_id)
+
+    def _clear_waypoint(self):
+        """Clear active waypoint state."""
+        self.waypoint_pos = None
+        self.waypoint_goal_key = None
+        self.waypoint_bfs_dist = None
+        self.waypoint_missing_steps = 0
+        self.local_waypoint_distances = None
+        self.local_waypoint_distances_key = None
+
+    def _get_waypoint_local_dist(self, waypoint_pos, local_distances):
+        """Get current local BFS distance to a global waypoint position."""
+        cell = self._global_pos_to_local_cell(waypoint_pos)
+        if cell is None:
+            return float("inf")
+        row, col = cell
+        return float(local_distances[row, col])
+
+    def _set_waypoint(self, goal_key, waypoint_pos, waypoint_dist):
+        """Set the active waypoint and reset waypoint-distance cache."""
+        self.waypoint_pos = waypoint_pos
+        self.waypoint_goal_key = goal_key
+        self.waypoint_bfs_dist = float(waypoint_dist)
+        self.local_waypoint_distances = None
+        self.local_waypoint_distances_key = None
+
+    def _get_local_target_waypoint(self, local_distances):
+        """Return the locally reachable target center, if visible."""
+        if self.target_pos is None:
+            return None, float("inf")
+
+        target_cell = self._global_pos_to_local_cell(self.target_pos)
+        if target_cell is None:
+            return None, float("inf")
+
+        row, col = target_cell
+        bfs_dist = float(local_distances[row, col])
+        if not np.isfinite(bfs_dist):
+            return None, float("inf")
+
+        return self._to_grid_pos(self.target_pos), bfs_dist
+
+    def _get_path_waypoint(self, local_distances):
+        """Select the farthest locally reachable path node within the lookahead radius."""
+        if len(self.global_path) == 0:
+            return None, float("inf")
+
+        best_pos = None
+        best_dist = float("inf")
+        start_idx = self._get_current_path_index()
+        for idx in range(start_idx, len(self.global_path)):
+            path_pos = self.global_path[idx]
+            cell = self._global_pos_to_local_cell(path_pos)
+            if cell is None:
+                if best_pos is not None:
+                    break
+                continue
+
+            row, col = cell
+            bfs_dist = float(local_distances[row, col])
+            if not np.isfinite(bfs_dist):
+                continue
+            if bfs_dist <= 0.0 or bfs_dist > Config.WAYPOINT_LOOKAHEAD_RADIUS:
+                continue
+
+            best_pos = path_pos
+            best_dist = bfs_dist
+
+        return best_pos, best_dist
+
+    def _select_waypoint(self, goal_key, local_distances, force_global_replan=False):
+        """Select a stable local waypoint from the current global plan."""
+        if goal_key is None or (self.target_bounds is None and self.target_pos is None):
+            self._clear_waypoint()
+            return False
+
+        target_waypoint, target_dist = self._get_local_target_waypoint(local_distances)
+        if target_waypoint is not None:
+            self._set_waypoint(goal_key, target_waypoint, target_dist)
+            return True
+
+        if not self._ensure_global_path(goal_key, force=force_global_replan):
+            self._clear_waypoint()
+            return False
+
+        best_pos, best_dist = self._get_path_waypoint(local_distances)
+        if best_pos is None and not force_global_replan and self._ensure_global_path(goal_key, force=True):
+            best_pos, best_dist = self._get_path_waypoint(local_distances)
+
+        if best_pos is None:
+            self._clear_waypoint()
+            return False
+
+        self._set_waypoint(goal_key, best_pos, best_dist)
+        return True
+
+    def _update_waypoint_state(self):
+        """Keep or reselect a local reachable waypoint for the current goal."""
+        self.waypoint_reached = False
+        self.completed_waypoint_pos = None
+        self.completed_waypoint_goal_key = None
+        self.completed_waypoint_cur_dist = None
+
+        goal_key = self._get_goal_key()
+        if goal_key is None or (self.target_bounds is None and self.target_pos is None):
+            self._clear_waypoint()
+            self.waypoint_no_improve_steps = 0
+            self.waypoint_stuck_replans = 0
+            return
+
+        local_distances = self._get_local_bfs_distances()
+        if not np.isfinite(local_distances).any():
+            self._clear_waypoint()
+            self.waypoint_no_improve_steps = 0
+            self.waypoint_stuck_replans = 0
+            return
+
+        old_dist = self._get_waypoint_local_dist(self.waypoint_pos, local_distances)
+        old_waypoint_valid = self.waypoint_goal_key == goal_key and np.isfinite(old_dist)
+        waypoint_missing = (
+            self.waypoint_pos is not None
+            and self.waypoint_goal_key == goal_key
+            and not old_waypoint_valid
+        )
+        if waypoint_missing:
+            self.waypoint_missing_steps += 1
+        else:
+            self.waypoint_missing_steps = 0
+
+        if old_waypoint_valid and old_dist <= 0.0:
+            self.waypoint_reached = True
+            self.completed_waypoint_pos = self.waypoint_pos
+            self.completed_waypoint_goal_key = self.waypoint_goal_key
+            self.completed_waypoint_cur_dist = old_dist
+            self.waypoint_no_improve_steps = 0
+            self.waypoint_stuck_replans = 0
+            self.waypoint_missing_steps = 0
+            self._select_waypoint(goal_key, local_distances)
+            return
+
+        force_global_replan = self._should_force_global_replan(old_waypoint_valid)
+
+        if old_waypoint_valid and not force_global_replan and self.waypoint_no_improve_steps < Config.WAYPOINT_REPLAN_STUCK_STEPS:
+            self.waypoint_bfs_dist = old_dist
+            return
+
+        self.waypoint_no_improve_steps = 0
+        if force_global_replan:
+            self.waypoint_stuck_replans = 0
+            self.waypoint_missing_steps = 0
+        elif old_waypoint_valid:
+            self.waypoint_stuck_replans += 1
+        self._select_waypoint(goal_key, local_distances, force_global_replan=force_global_replan)
+
+    def _get_nearest_target_station(self, only_safe=False):
         """Select nearest target station from current carried packages.
 
         从当前携带包裹对应的驿站中选择最近目标。
         """
         target_ids = set(self.packages)
         target_stations = [station for station in self.stations if station.get("config_id", 0) in target_ids]
+        if only_safe:
+            target_stations = [station for station in target_stations if self._is_station_safe(station)]
         if len(target_stations) == 0:
             return None
 
         return min(
             target_stations,
             key=lambda s: self._get_region_distance(self.cur_pos, self._get_station_bounds(s)),
+        )
+
+    def _get_station_goal(self, only_safe=False):
+        """Build a station goal tuple if any matching target station exists."""
+        station = self._get_nearest_target_station(only_safe=only_safe)
+        if station is None:
+            return None
+
+        return (
+            MODE_STATION,
+            station.get("config_id", 0),
+            self._get_organ_pos(station),
+            self._get_station_bounds(station),
         )
 
     def _get_nearest_charge_target(self, from_pos=None):
@@ -722,7 +1399,7 @@ class Preprocessor:
 
         if charger_pos is None and warehouse_pos is None:
             return None, None, None, float("inf")
-        if charger_dist <= warehouse_dist:
+        if charger is not None and charger_pos is not None and charger_dist <= warehouse_dist:
             return MODE_CHARGER, charger.get("config_id", 0), charger_pos, charger_dist
         return MODE_WAREHOUSE_CHARGE, "warehouse", warehouse_pos, warehouse_dist
 
@@ -743,6 +1420,25 @@ class Preprocessor:
 
         need = d_to_station + d_retreat + Config.SAFETY_MARGIN
         return self.battery >= need
+
+    def _get_charge_exit_goal(self):
+        """Return the next task goal once charging is no longer necessary."""
+        if self.package_count == 0:
+            warehouse, warehouse_pos, _ = self._get_nearest_warehouse()
+            warehouse_bounds = self._get_warehouse_bounds(warehouse)
+            if warehouse_pos is None:
+                return None
+            if not self._can_reach_target(target_pos=warehouse_pos, target_bounds=warehouse_bounds):
+                return None
+            return (MODE_WAREHOUSE_REFILL, "warehouse", warehouse_pos, warehouse_bounds)
+
+        return self._get_station_goal(only_safe=True)
+
+    def _should_exit_charge_mode(self):
+        """Exit charging as soon as battery is enough for the next task stage."""
+        if self.mode not in (MODE_CHARGER, MODE_WAREHOUSE_CHARGE):
+            return False
+        return self._get_charge_exit_goal() is not None
 
     def _is_current_target_valid(self):
         """Check whether the locked goal is still valid.
@@ -765,10 +1461,10 @@ class Preprocessor:
             return self.target_id in set(self.packages) and self._get_station_by_id(self.target_id) is not None
 
         if self.mode == MODE_CHARGER:
-            return self._get_charger_by_id(self.target_id) is not None
+            return self._get_charger_by_id(self.target_id) is not None and not self._should_exit_charge_mode()
 
         if self.mode == MODE_WAREHOUSE_CHARGE:
-            return self._get_nearest_warehouse()[1] is not None
+            return self._get_nearest_warehouse()[1] is not None and not self._should_exit_charge_mode()
 
         return False
 
@@ -824,61 +1520,52 @@ class Preprocessor:
 
         根据当前任务状态选择新的锁定目标。
         """
+        charge_exit_goal = self._get_charge_exit_goal() if self.mode in (MODE_CHARGER, MODE_WAREHOUSE_CHARGE) else None
+        if charge_exit_goal is not None:
+            self._lock_goal(*charge_exit_goal)
+            return
+
         if self.package_count == 0:
             warehouse, warehouse_pos, _ = self._get_nearest_warehouse()
             warehouse_bounds = self._get_warehouse_bounds(warehouse)
             if warehouse_pos is not None and self._can_reach_target(target_pos=warehouse_pos, target_bounds=warehouse_bounds):
-                self.mode = MODE_WAREHOUSE_REFILL
-                self.target_id = "warehouse"
-                self.target_pos = warehouse_pos
-                self.target_bounds = warehouse_bounds
+                self._lock_goal(MODE_WAREHOUSE_REFILL, "warehouse", warehouse_pos, warehouse_bounds)
                 return
 
             charger, charger_pos, _ = self._get_nearest_charger()
-            if charger_pos is not None:
-                self.mode = MODE_CHARGER
-                self.target_id = charger.get("config_id", 0)
-                self.target_pos = charger_pos
-                self.target_bounds = self._get_charger_bounds(charger)
+            if charger is not None and charger_pos is not None:
+                self._lock_goal(
+                    MODE_CHARGER,
+                    charger.get("config_id", 0),
+                    charger_pos,
+                    self._get_charger_bounds(charger),
+                )
                 return
 
-            self.mode = MODE_WAREHOUSE_REFILL
-            self.target_id = "warehouse"
-            self.target_pos = warehouse_pos
-            self.target_bounds = warehouse_bounds
+            self._lock_goal(MODE_WAREHOUSE_REFILL, "warehouse", warehouse_pos, warehouse_bounds)
             return
 
-        station = self._get_nearest_target_station()
-        if station is not None and self._is_station_safe(station):
-            self.mode = MODE_STATION
-            self.target_id = station.get("config_id", 0)
-            self.target_pos = self._get_organ_pos(station)
-            self.target_bounds = self._get_station_bounds(station)
+        safe_station_goal = self._get_station_goal(only_safe=True)
+        if safe_station_goal is not None:
+            self._lock_goal(*safe_station_goal)
             return
 
         mode, target_id, target_pos, _ = self._get_nearest_charge_target()
         if target_pos is not None:
-            self.mode = mode
-            self.target_id = target_id
-            self.target_pos = target_pos
             if mode == MODE_CHARGER:
-                self.target_bounds = self._get_charger_bounds(self._get_charger_by_id(target_id))
+                target_bounds = self._get_charger_bounds(self._get_charger_by_id(target_id))
             else:
                 warehouse, _, _ = self._get_nearest_warehouse()
-                self.target_bounds = self._get_warehouse_bounds(warehouse)
+                target_bounds = self._get_warehouse_bounds(warehouse)
+            self._lock_goal(mode, target_id, target_pos, target_bounds)
             return
 
-        if station is not None:
-            self.mode = MODE_STATION
-            self.target_id = station.get("config_id", 0)
-            self.target_pos = self._get_organ_pos(station)
-            self.target_bounds = self._get_station_bounds(station)
+        station_goal = self._get_station_goal(only_safe=False)
+        if station_goal is not None:
+            self._lock_goal(*station_goal)
             return
 
-        self.mode = None
-        self.target_id = None
-        self.target_pos = None
-        self.target_bounds = None
+        self._clear_goal()
 
     def _update_goal_state(self):
         """Update locked goal state with event-triggered replanning.
@@ -918,6 +1605,9 @@ class Preprocessor:
         self.prev_target_pos = self.target_pos
         self.prev_target_bounds = self.target_bounds
         self.prev_nearest_npc_dist = self._get_nearest_npc_distance()
+        self.prev_waypoint_pos = self.waypoint_pos
+        self.prev_waypoint_goal_key = self.waypoint_goal_key
+        self.prev_waypoint_bfs_dist = self.waypoint_bfs_dist
 
     def _get_legal_action(self):
         """Get legal action mask.
@@ -991,40 +1681,56 @@ class Preprocessor:
 
         charge_event = self.prev_charger_count is not None and self.charger_count > self.prev_charger_count
         warehouse_event = self.prev_warehouse_count is not None and self.warehouse_count > self.prev_warehouse_count
-        newly_delivered = max(0, self.delivered - self.prev_delivered)
+        prev_delivered = self.prev_delivered if self.prev_delivered is not None else self.delivered
+        newly_delivered = max(0, self.delivered - prev_delivered)
 
         # 1. Delivery reward / 投递主奖励
         reward += Config.DELIVERY_REWARD_SCALE * newly_delivered
 
-        # 2. Progress shaping / 锁定目标的势函数奖励
-        if self.mode == self.prev_mode and self.target_id == self.prev_target_id:
-            target_bounds = self.target_bounds if self.target_bounds is not None else self.prev_target_bounds
-            target_pos = self.target_pos if self.target_pos is not None else self.prev_target_pos
-            prev_dist = self._get_target_region_distance(
-                self.prev_pos,
-                target_bounds=target_bounds,
-                target_pos=target_pos,
-            )
-            cur_dist = self._get_target_region_distance(
-                self.cur_pos,
-                target_bounds=target_bounds,
-                target_pos=target_pos,
-            )
-            if np.isfinite(prev_dist) and np.isfinite(cur_dist):
-                reward += self._get_progress_coef(self.mode) * np.clip(prev_dist - cur_dist, -1.0, 1.0)
+        # 2. Waypoint BFS progress shaping / waypoint BFS 进度奖励
+        waypoint_delta = None
+        if (
+            self.waypoint_reached
+            and self.completed_waypoint_goal_key == self.prev_waypoint_goal_key
+            and self.completed_waypoint_pos == self.prev_waypoint_pos
+            and self.prev_waypoint_bfs_dist is not None
+            and self.completed_waypoint_cur_dist is not None
+        ):
+            waypoint_delta = float(self.prev_waypoint_bfs_dist) - float(self.completed_waypoint_cur_dist)
+        elif (
+            self.waypoint_goal_key == self.prev_waypoint_goal_key
+            and self.waypoint_pos == self.prev_waypoint_pos
+            and self.prev_waypoint_bfs_dist is not None
+            and self.waypoint_bfs_dist is not None
+        ):
+            waypoint_delta = float(self.prev_waypoint_bfs_dist) - float(self.waypoint_bfs_dist)
 
-        # 3. Charge event / 充电事件奖励
+        if waypoint_delta is not None and np.isfinite(waypoint_delta):
+            reward += self._get_progress_coef(self.mode) * np.clip(waypoint_delta, -1.0, 1.0)
+            if waypoint_delta > Config.WAYPOINT_PROGRESS_TOL:
+                self.waypoint_no_improve_steps = 0
+                self.waypoint_stuck_replans = 0
+            else:
+                self.waypoint_no_improve_steps += 1
+
+        if self.waypoint_reached:
+            reward += Config.WAYPOINT_REACHED_REWARD
+
+        # 3. Visitation penalty / 全局访问惩罚
+        reward -= Config.VISIT_PENALTY_SCALE * self._get_visit_cost(self.cur_pos)
+
+        # 4. Charge event / 充电事件奖励
         if charge_event and self.prev_mode == MODE_CHARGER:
             reward += Config.CHARGE_EVENT_REWARD
 
-        # 4. Warehouse event / 仓库事件奖励
+        # 5. Warehouse event / 仓库事件奖励
         if warehouse_event:
             if self.prev_mode == MODE_WAREHOUSE_REFILL and self.prev_package_count == 0 and self.package_count > 0:
                 reward += Config.WAREHOUSE_REFILL_REWARD
             elif self.prev_mode == MODE_WAREHOUSE_CHARGE:
                 reward += Config.WAREHOUSE_CHARGE_REWARD
 
-        # 5. Smooth NPC risk penalty / 平滑 NPC 风险惩罚
+        # 6. Smooth NPC risk penalty / 平滑 NPC 风险惩罚
         nearest_npc_dist = self._get_nearest_npc_distance()
         if nearest_npc_dist <= Config.NPC_PENALTY_RADIUS:
             reward -= Config.NPC_PENALTY_SCALE * np.exp(-(nearest_npc_dist - 1.0) / 1.5)
@@ -1041,9 +1747,6 @@ class Preprocessor:
                 1.0,
             )
 
-        # 6. Light block penalty / 轻量阻塞惩罚
-        if self.cur_pos == self.prev_pos and not charge_event and not warehouse_event:
-            reward -= Config.BLOCK_PENALTY
 
         # 7. Step penalty / 每步惩罚
         reward -= Config.STEP_PENALTY

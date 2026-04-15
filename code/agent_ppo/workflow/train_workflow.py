@@ -22,12 +22,43 @@ from tools.train_env_conf_validate import read_usr_conf
 from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
 
 
+MODEL_SAVE_INTERVAL_SECONDS = 5 * 60
+MODEL_BACKUP_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "train", "backup_model")
+)
+
+
+def _summarize_runtime_objects(items):
+    return [
+        f"{idx}:{obj.__class__.__module__}.{obj.__class__.__name__}@{id(obj)}"
+        for idx, obj in enumerate(items or [])
+    ]
+
+
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     """Training entry point called by the platform.
 
     训练入口，平台调用。
     """
     last_save_model_time = time.time()
+    if not envs or not agents:
+        if logger:
+            logger.error(
+                f"workflow startup failed, pid={os.getpid()}, "
+                f"env_count={len(envs) if envs is not None else 0}, "
+                f"agent_count={len(agents) if agents is not None else 0}"
+            )
+        return
+
+    if logger:
+        logger.info(
+            f"workflow startup, pid={os.getpid()}, env_count={len(envs)}, "
+            f"agent_count={len(agents)}, selected_env_index=0, selected_agent_index=0, "
+            f"args_count={len(args)}, kwargs_keys={sorted(kwargs.keys())}, "
+            f"envs={_summarize_runtime_objects(envs)}, "
+            f"agents={_summarize_runtime_objects(agents)}"
+        )
+
     env = envs[0]
     agent = agents[0]
 
@@ -50,8 +81,9 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             g_data.clear()
 
             now = time.time()
-            if now - last_save_model_time >= 1800:
-                agent.save_model()
+            if now - last_save_model_time >= MODEL_SAVE_INTERVAL_SECONDS:
+                os.makedirs(MODEL_BACKUP_DIR, exist_ok=True)
+                agent.save_model(path=MODEL_BACKUP_DIR, id=str(int(now)))
                 last_save_model_time = now
 
 
